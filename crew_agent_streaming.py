@@ -1,131 +1,126 @@
 import os
-import time
 import subprocess
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+import time
 from crewai import Agent, Task, Crew
 
 # ---------------------------
 # CONFIGURATION
 # ---------------------------
-WATCH_FOLDER = "streamer_1/raw"
-MIN_VIDEOS = 3  # Number of videos required to trigger streaming
-STREAM_URL = "rtmp://localhost:1935/live"  # Change port if needed
+VIDEO_FOLDER = "streamer_1/raw"
+STREAM_URL = "rtmp://localhost:1935/live"  # Change if needed
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.mov')  # Supported formats
+BATCH_SIZE = 5  # Number of videos per batch
+DELETE_COUNT = 2  # Number of oldest files to delete after a full loop
 
 # ---------------------------
-# AGENT 1: Folder Monitor Agent
+# HELPER FUNCTIONS
 # ---------------------------
-class FolderMonitor(FileSystemEventHandler):
-    def __init__(self, task_agent):
-        self.task_agent = task_agent
-
-    def on_modified(self, event):
-        """Triggered when a file is created or modified in the folder."""
-        if event.is_directory:
-            return
-        time.sleep(2)  # Short delay to ensure file is fully written
-        self.task_agent.run()
-
-def count_videos():
-    """Counts video files in the folder."""
-    return [f for f in os.listdir(WATCH_FOLDER) if f.endswith(('.mp4', '.mkv', '.mov'))]
-
 def get_video_list():
-    """Generates FFmpeg-compatible input file list."""
-    video_files = count_videos()
-    list_file_path = os.path.join(WATCH_FOLDER, "file_list.txt")
+    """Returns a sorted list of video file paths."""
+    videos = sorted([
+        os.path.join(VIDEO_FOLDER, f) for f in os.listdir(VIDEO_FOLDER)
+        if f.endswith(VIDEO_EXTENSIONS)
+    ])
     
-    with open(list_file_path, "w") as f:
-        for video in video_files:
-            f.write(f"file '{os.path.join(WATCH_FOLDER, video)}'\n")
+    if not videos:
+        print("[X] No videos found in the folder.")
+    
+    return videos
 
-    return list_file_path, len(video_files)
-
-monitor_agent = Agent(
-    role="Folder Monitor",
-    goal="Monitor the folder for new video files and trigger the streaming process once at least X videos are available.",
-    backstory="You are responsible for ensuring the required number of videos are available before streaming starts.",
-    allow_delegation=False
-)
-
-def monitor_folder():
-    video_count = len(count_videos())
-    if video_count >= MIN_VIDEOS:
-        print(f"[V] Found {video_count} videos. Triggering FFmpeg streaming.")
-        return "START_STREAMING"
-    else:
-        print(f"[W] Waiting for more videos... (Current: {video_count}/{MIN_VIDEOS})")
-        return "WAIT"
-
-monitor_task = Task(
-    description="Check if the required number of videos exist. If they do, trigger the FFmpeg streaming process.",
-    agent=monitor_agent,
-    function=monitor_folder
-)
+def get_batches(video_list, batch_size):
+    """Splits the video list into batches."""
+    return [video_list[i:i + batch_size] for i in range(0, len(video_list), batch_size)]
 
 # ---------------------------
-# AGENT 2: FFmpeg Stream Agent
+# AGENT 1: Streaming Manager
 # ---------------------------
 stream_agent = Agent(
     role="Streaming Manager",
-    goal="Combine and stream the videos in real-time using FFmpeg.",
-    backstory="You are responsible for managing the FFmpeg streaming process, ensuring smooth and continuous video playback.",
+    goal="Stream videos in batches, looping after all videos are streamed.",
+    backstory="You manage FFmpeg streaming, ensuring it runs in batches and loops continuously.",
     allow_delegation=False
 )
 
 def stream_videos():
-    """Streams combined videos without saving them."""
-    list_file, video_count = get_video_list()
+    """Streams videos in batches and loops after completion."""
+    while True:
+        videos = get_video_list()
+        if not videos:
+            print("[0] No videos found. Retrying in 30 seconds...")
+            time.sleep(30)
+            continue
+        
+        batches = get_batches(videos, BATCH_SIZE)
 
-    if video_count < MIN_VIDEOS:
-        return "[X] Not enough videos to start streaming."
+        for batch in batches:
+            print(f"[!] Now Streaming Batch: {batch}")
 
-    print("[OO...OOO] Starting FFmpeg Streaming...")
+            # Create temporary file list for FFmpeg
+            list_file_path = os.path.join(VIDEO_FOLDER, "file_list.txt")
+            with open(list_file_path, "w") as f:
+                for video in batch:
+                    f.write(f"file '{video}'\n")
 
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-b:v", "3000k",
-        "-maxrate", "3000k",
-        "-bufsize", "6000k",
-        "-f", "flv", STREAM_URL
-    ]
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file_path,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-b:v", "3000k",
+                "-maxrate", "3000k",
+                "-bufsize", "6000k",
+                "-f", "flv", STREAM_URL
+            ]
+            
+            subprocess.run(ffmpeg_cmd)
 
-    subprocess.run(ffmpeg_cmd)
-    
-    print("[X] Streaming ended. Restarting from the first video.")
-    return "RESTART_MONITOR"
+        print("[O] Restarting from the first video...")
+        delete_oldest_videos()  # Trigger cleanup after full loop
 
 stream_task = Task(
-    description="Combine all videos and stream them to the localhost endpoint without saving.",
+    description="Stream all videos in batches and loop after completion.",
     agent=stream_agent,
     function=stream_videos
 )
 
 # ---------------------------
-# CREW SETUP & MONITORING
+# AGENT 2: File Cleanup Agent
 # ---------------------------
-crew = Crew(agents=[monitor_agent, stream_agent], tasks=[monitor_task, stream_task])
+cleanup_agent = Agent(
+    role="File Cleanup Manager",
+    goal="Delete the oldest X number of files after a full streaming loop.",
+    backstory="You manage storage by removing the oldest videos to prevent excessive buildup.",
+    allow_delegation=False
+)
 
-def start_monitoring():
-    """Monitors the folder continuously for new videos."""
-    print(f"[O] Watching folder: {WATCH_FOLDER}")
+def delete_oldest_videos():
+    """Deletes the oldest X number of files after a full loop."""
+    videos = get_video_list()
+    
+    if len(videos) > DELETE_COUNT:
+        oldest_files = videos[:DELETE_COUNT]
+        for file in oldest_files:
+            try:
+                os.remove(file)
+                print(f"[🗑️] Deleted: {file}")
+            except Exception as e:
+                print(f"[X] Error deleting {file}: {e}")
+    else:
+        print("[!] Not enough videos to delete.")
 
-    observer = Observer()
-    observer.schedule(FolderMonitor(crew), WATCH_FOLDER, recursive=False)
-    observer.start()
+cleanup_task = Task(
+    description="Delete the oldest videos after each full loop.",
+    agent=cleanup_agent,
+    function=delete_oldest_videos
+)
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+# ---------------------------
+# CREW SETUP
+# ---------------------------
+crew = Crew(agents=[stream_agent, cleanup_agent], tasks=[stream_task, cleanup_task])
 
 if __name__ == "__main__":
-    start_monitoring()
+    crew.kickoff()
